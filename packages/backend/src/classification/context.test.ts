@@ -1,0 +1,333 @@
+/**
+ * Tests for the evidence packet builder.
+ *
+ * WHAT THIS FILE COVERS
+ * The two samplers and the renderer — budget caps, temporal spread, shape
+ * diversity, the per-minute timeline, the per-endpoint breakdown, and the
+ * marker lines the stub provider depends on.
+ *
+ * SEVERAL TESTS HERE ARE BUGS, RESTATED AS ASSERTIONS
+ * Each of these failed in production evidence before the test existed:
+ *
+ *   "keeps a one-off line that uniform sampling would drown"
+ *       A deploy banner, one line among two thousand routine ones, was dropped
+ *       by uniform sampling — leaving a benign window that no reader could have
+ *       judged correctly. This is why `sampleDiverse` exists.
+ *
+ *   "keeps the one narration line that explains the window"
+ *       The same failure at the renderer level rather than the sampler level.
+ *
+ *   "shows the window minute by minute"
+ *       Without a time axis, a burst that stopped after sixty seconds is
+ *       indistinguishable from five minutes of steady failure. A real
+ *       classification was wrong for exactly that reason.
+ *
+ *   "shows where latency is concentrated"
+ *       Without it, "the service is slow" and "one background path is slow
+ *       while users are fine" are identical evidence with opposite verdicts.
+ *
+ * WHY THIS IS TESTABLE AT ALL
+ * `context.ts` is pure — no database, no clock, no network. Same window in,
+ * same prompt out. That is what lets the packet's content be asserted with
+ * plain fixtures and no setup, and it is why a regression in classification
+ * quality can be attributed to the prompt rather than to whatever the sampler
+ * happened to pick that run.
+ */
+
+import { describe, expect, it } from "vitest";
+import type { AnomalyTrigger } from "@obs/shared";
+import {
+  contextBudget,
+  renderClassificationContext,
+  sampleDiverse,
+  sampleEvenly,
+  type ClassificationInput,
+  type ContextLogLine,
+} from "./context";
+
+const WINDOW_START = new Date("2026-08-10T08:23:00.000Z");
+const WINDOW_END = new Date("2026-08-10T08:28:00.000Z");
+
+const NEW_SIGNATURE_TRIGGER: AnomalyTrigger = {
+  kind: "new_error_signature",
+  service: "orders-api",
+  signature: "TypeError: Cannot read properties of null (reading <str>)",
+  sampleMessage: "TypeError: Cannot read properties of null (reading 'toFixed')",
+  occurrences: 210,
+};
+
+function makeLines(count: number, level: ContextLogLine["level"] = "error"): ContextLogLine[] {
+  return Array.from({ length: count }, (_, i) => ({
+    timestamp: new Date(WINDOW_START.getTime() + i * 1000),
+    level,
+    message: `failure number ${i}`,
+    endpoint: "POST /orders",
+    statusCode: 500,
+  }));
+}
+
+function makeInput(overrides: Partial<ClassificationInput> = {}): ClassificationInput {
+  const base: ClassificationInput = {
+    service: "orders-api",
+    windowStart: WINDOW_START,
+    windowEnd: WINDOW_END,
+    triggers: [NEW_SIGNATURE_TRIGGER],
+    metrics: { requestCount: 1200, errorCount: 211, p50Ms: 45, p95Ms: 82, p99Ms: 120 },
+    timeline: Array.from({ length: 5 }, (_, i) => ({
+      bucketStart: new Date(WINDOW_START.getTime() + i * 60_000),
+      requestCount: 240,
+      errorCount: i === 0 ? 200 : 3,
+      p95Ms: 82,
+    })),
+    endpoints: [
+      { endpoint: "/orders", requestCount: 800, errorCount: 200, p95Ms: 95 },
+      { endpoint: "/orders/:id", requestCount: 400, errorCount: 11, p95Ms: 60 },
+    ],
+    signatures: [
+      {
+        signature: "TypeError: Cannot read properties of null (reading <str>)",
+        occurrences: 210,
+        sampleMessage: "TypeError: Cannot read properties of null (reading 'toFixed')",
+      },
+    ],
+    logLines: makeLines(50),
+    totalLogLines: 1200,
+  };
+  return { ...base, ...overrides };
+}
+
+describe("sampleEvenly", () => {
+  it("returns everything when the input is under the limit", () => {
+    expect(sampleEvenly([1, 2, 3], 10)).toEqual([1, 2, 3]);
+  });
+
+  it("spans the whole input rather than taking a prefix", () => {
+    const sampled = sampleEvenly(Array.from({ length: 100 }, (_, i) => i), 5);
+
+    expect(sampled).toHaveLength(5);
+    expect(sampled[0]).toBe(0);
+    // A prefix slice would end at 4; an incident's later phase would be hidden.
+    expect(sampled.at(-1)).toBeGreaterThan(50);
+  });
+
+  it("returns nothing for a zero limit", () => {
+    expect(sampleEvenly([1, 2, 3], 0)).toEqual([]);
+  });
+});
+
+describe("sampleDiverse", () => {
+  const shape = (value: string): string => value;
+
+  it("keeps a one-off line that uniform sampling would drown", () => {
+    // The deploy-restart failure: one banner among two thousand routine lines.
+    const lines = [...Array.from({ length: 2000 }, () => "GET /orders 200"), "v1.4.2 starting up"];
+
+    expect(sampleDiverse(lines, 5, shape)).toContain("v1.4.2 starting up");
+  });
+
+  it("still fills the budget from common shapes", () => {
+    const lines = [...Array.from({ length: 2000 }, () => "GET /orders 200"), "v1.4.2 starting up"];
+
+    expect(sampleDiverse(lines, 5, shape)).toHaveLength(5);
+  });
+
+  it("shares the budget across shapes rather than by volume", () => {
+    const lines = [
+      ...Array.from({ length: 100 }, () => "common"),
+      ...Array.from({ length: 10 }, () => "rare"),
+    ];
+
+    const sampled = sampleDiverse(lines, 6, shape);
+
+    expect(sampled.filter((line) => line === "rare").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("returns everything when the input is under the limit", () => {
+    expect(sampleDiverse(["a", "b"], 5, shape)).toEqual(["a", "b"]);
+  });
+
+  it("never exceeds the limit however many shapes there are", () => {
+    const lines = Array.from({ length: 50 }, (_, i) => `shape ${i}`);
+
+    expect(sampleDiverse(lines, 6, shape)).toHaveLength(6);
+  });
+});
+
+describe("renderClassificationContext", () => {
+  it("emits the marker lines the stub provider parses", () => {
+    const rendered = renderClassificationContext(makeInput());
+
+    expect(rendered).toMatch(/^Service: orders-api$/m);
+    expect(rendered).toMatch(/^Triggers fired: new_error_signature$/m);
+  });
+
+  it("explains each trigger in words, not just its name", () => {
+    const rendered = renderClassificationContext(makeInput());
+
+    expect(rendered).toContain("appears nowhere in the baseline hour");
+    expect(rendered).toContain("210 times");
+  });
+
+  it("includes window totals with a computed error rate", () => {
+    const rendered = renderClassificationContext(makeInput());
+
+    expect(rendered).toContain("requests 1200 | errors 211 (17.6%)");
+    expect(rendered).toContain("p95 82ms");
+  });
+
+  it("does not divide by zero on a window with no requests", () => {
+    const rendered = renderClassificationContext(
+      makeInput({ metrics: { requestCount: 0, errorCount: 0, p50Ms: 0, p95Ms: 0, p99Ms: 0 } }),
+    );
+
+    expect(rendered).toContain("errors 0 (0.0%)");
+  });
+
+  it("caps the log sample regardless of window size", () => {
+    const rendered = renderClassificationContext({
+      ...makeInput(),
+      logLines: [...makeLines(5000), ...makeLines(500, "info")],
+      totalLogLines: 5500,
+    });
+
+    const sampleLines = rendered
+      .split("\n")
+      .filter((line) => line.includes("POST /orders") && line.includes("—"));
+
+    expect(sampleLines.length).toBeLessThanOrEqual(
+      contextBudget.maxErrorLines + contextBudget.maxHealthyLines,
+    );
+    // The model is still told the true scale it was sampled from.
+    expect(rendered).toContain("drawn from 5500");
+  });
+
+  it("keeps the one narration line that explains the window", () => {
+    // A deploy banner among hundreds of routine requests. Losing this line
+    // turns a benign restart into an indistinguishable outage.
+    const routine = makeLines(500, "info").map((line) => ({
+      ...line,
+      message: "GET /orders 200",
+    }));
+    const banner: ContextLogLine = {
+      timestamp: new Date(WINDOW_START.getTime() + 1000),
+      level: "info",
+      message: "orders-api v1.4.2 starting up (deploy 7c1e044)",
+    };
+
+    const rendered = renderClassificationContext({
+      ...makeInput(),
+      logLines: [...routine, banner],
+    });
+
+    expect(rendered).toContain("v1.4.2 starting up");
+  });
+
+  it("keeps a few healthy lines so degraded is distinguishable from down", () => {
+    const rendered = renderClassificationContext({
+      ...makeInput(),
+      logLines: [...makeLines(100), ...makeLines(100, "info")],
+    });
+
+    expect(rendered).toContain("INFO");
+    expect(rendered).toContain("ERROR");
+  });
+
+  it("lists the most frequent signatures first and says how many were cut", () => {
+    const signatures = Array.from({ length: 20 }, (_, i) => ({
+      signature: `signature ${i}`,
+      occurrences: i,
+      sampleMessage: `sample ${i}`,
+    }));
+
+    const rendered = renderClassificationContext(makeInput({ signatures }));
+
+    expect(rendered).toContain(`top ${contextBudget.maxSignatures} of 20`);
+    expect(rendered).toContain("signature 19");
+    expect(rendered).not.toContain("signature 0\n");
+  });
+
+  it("truncates a stack trace instead of spending the budget on it", () => {
+    const rendered = renderClassificationContext({
+      ...makeInput(),
+      logLines: [
+        {
+          timestamp: WINDOW_START,
+          level: "error",
+          message: "x".repeat(5000),
+          endpoint: "POST /orders",
+        },
+      ],
+    });
+
+    expect(rendered).toContain("…");
+    expect(rendered).not.toContain("x".repeat(contextBudget.maxMessageChars + 1));
+  });
+
+  it("shows the window minute by minute, so a burst is distinguishable from steady failure", () => {
+    // The deploy-restart failure: without this, errors that stopped after one
+    // minute look identical to errors continuing for five.
+    const rendered = renderClassificationContext(makeInput());
+    const lines = rendered.split("\n");
+    const heading = lines.findIndex((line) => line.startsWith("Per-minute detail"));
+
+    expect(heading).toBeGreaterThan(-1);
+    expect(lines[heading + 1]).toContain("200 err");
+    expect(lines[heading + 2]).toContain("3 err");
+  });
+
+  it("keeps the most recent minutes when a merged window is long", () => {
+    // An extended anomaly can span hours; what matters is whether it is still
+    // happening, so truncation drops the oldest minutes rather than the newest.
+    const rendered = renderClassificationContext(
+      makeInput({
+        timeline: Array.from({ length: 40 }, (_, i) => ({
+          bucketStart: new Date(WINDOW_START.getTime() + i * 60_000),
+          requestCount: 240,
+          errorCount: i,
+          p95Ms: 80,
+        })),
+      }),
+    );
+
+    expect(rendered).toContain(`last ${contextBudget.maxTimelineMinutes} of 40 minutes`);
+    expect(rendered).toContain("39 err");
+    expect(rendered).not.toContain("    0 err");
+  });
+
+  it("shows where latency is concentrated, slowest path first", () => {
+    // The batch-job case: aggregate p95 is terrible, one background path owns
+    // all of it, and user endpoints are fine. Without this section those two
+    // situations are indistinguishable in the evidence.
+    const rendered = renderClassificationContext(
+      makeInput({
+        endpoints: [
+          { endpoint: "/orders", requestCount: 1200, errorCount: 2, p95Ms: 90 },
+          { endpoint: "/internal/reconcile", requestCount: 225, errorCount: 0, p95Ms: 4210 },
+        ],
+      }),
+    );
+
+    const lines = rendered.split("\n");
+    const heading = lines.findIndex((line) => line.startsWith("Latency by endpoint"));
+
+    expect(heading).toBeGreaterThan(-1);
+    expect(lines[heading + 1]).toContain("/internal/reconcile");
+    expect(lines[heading + 1]).toContain("4210ms");
+  });
+
+  it("omits the endpoint breakdown when there is only one path", () => {
+    const rendered = renderClassificationContext(
+      makeInput({
+        endpoints: [{ endpoint: "/orders", requestCount: 1200, errorCount: 2, p95Ms: 90 }],
+      }),
+    );
+
+    expect(rendered).not.toContain("Latency by endpoint");
+  });
+
+  it("omits the signature section entirely when there are none", () => {
+    const rendered = renderClassificationContext(makeInput({ signatures: [] }));
+
+    expect(rendered).not.toContain("Error signatures");
+  });
+});
